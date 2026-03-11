@@ -1,0 +1,3 @@
+E:/worksapce/ecoSim/external/vorbis-subbuild/CMakeFiles/vorbis-populate.dir
+E:/worksapce/ecoSim/external/vorbis-subbuild/CMakeFiles/edit_cache.dir
+E:/worksapce/ecoSim/external/vorbis-subbuild/CMakeFiles/rebuild_cache.dir

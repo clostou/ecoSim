@@ -1,0 +1,36 @@
+# Configuration file for Prey vs Predator simulation
+# All times are expressed in seconds
+# All angle related values are expressed in degrees
+
+# ----- Window -----
+window_size = 1920, 1080
+fullscreen = 0
+
+# ----- Simulation -----
+# A new number -> a new sim
+seed = 15
+# The maximum number of threads to use (0 means number of available cores found)
+# note: changing this affect the output of the simulation. If you want to be able to replay simulations
+#       across multiple PCs, it might be a good idea to use a non null value here.
+thread_count = 0
+world_size = 300
+
+# ----- Initial population -----
+initial_prey_population = 300
+initial_pred_population = 300
+
+# Predator
+predator_attack_damage = 85
+
+# Prey
+prey_attack_damage = 20
+
+# ----- Plants -----
+# The number of plants when simulation starts
+plants_initial_count = 1000
+# The time between new random plants spawn
+plants_random_new_cooldown = 5.0
+# The number of new plants spawn
+plants_random_new_count = 1
+# The delay before a plant propagate to an adjacent cell
+plant_split_cooldown = 30.0

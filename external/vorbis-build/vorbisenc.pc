@@ -1,0 +1,14 @@
+# libvorbisenc pkg-config source file
+
+prefix=E:/worksapce/ecoSim/out/install/x64-Debug
+exec_prefix=E:/worksapce/ecoSim/out/install/x64-Debug/bin
+libdir=E:/worksapce/ecoSim/out/install/x64-Debug/lib
+includedir=E:/worksapce/ecoSim/out/install/x64-Debug/include
+
+Name: vorbisenc
+Description: vorbisenc is a library that provides a convenient API for setting up an encoding environment using libvorbis
+Version: 1.3.7
+Requires.private: vorbis
+Conflicts:
+Libs: -L${libdir} -lvorbisenc
+Cflags: -I${includedir}
