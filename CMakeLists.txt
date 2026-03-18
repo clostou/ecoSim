@@ -8,4 +8,5 @@ project (ecoSim LANGUAGES CXX)
 # 包含子项目。
 add_subdirectory (main)
 #add_subdirectory (agent)
+add_subdirectory (test/test-sfml)
 add_subdirectory (test/test-cuda)

@@ -16,6 +16,7 @@ FetchContent_Declare(SFML
     EXCLUDE_FROM_ALL
     SYSTEM)
 FetchContent_MakeAvailable(SFML)
+# 注意：下载到本地的第三方库需要手动删除`.git`子目录，防止Git自动链接子仓库或子模块
 
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 set(CMAKE_EXE_LINKER_FLAGS -static)    # or "-static-libgcc -static-libstdc++"
