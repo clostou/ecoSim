@@ -134,7 +134,7 @@ public:
         // 能量不足时降速
         if (m_energy <= 0.f) {
             m_energy = 0.f;
-            m_speed_max *= 0.5f;  // 惩罚系数
+            m_speed_max *= AgentConfig::ENERGY_PENALTY_FACTOR;
         }
 
         // 生命值归零则死亡

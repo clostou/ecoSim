@@ -57,6 +57,7 @@ namespace AgentConfig {
     constexpr float HUNGER_RATE       = 0.3f;    // 饥饿度增长/秒
     constexpr float HUNGER_THRESHOLD  = 80.0f;   // 饥饿伤害阈值
     constexpr float STARVATION_DAMAGE = 5.0f;    // 饥饿伤害/秒
+    constexpr float ENERGY_PENALTY_FACTOR = 0.5f; // 能量耗尽时的速度惩罚系数
 
     // --- 繁殖参数 ---
     constexpr float BREED_ENERGY_COST  = 30.0f;  // 繁殖能量消耗
