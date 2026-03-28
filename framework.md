@@ -1169,7 +1169,7 @@ namespace WorldConfig {
     // --- 初始种群 ---
     constexpr int INITIAL_PLANT_COUNT = 1000;
     constexpr int INITIAL_PREY_COUNT = 300;
-    constexpr int INITIAL_PRED_COUNT = 300;
+    constexpr int INITIAL_PREDATOR_COUNT = 300;
 }
 
 namespace NNConfig {
