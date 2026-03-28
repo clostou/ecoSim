@@ -1,82 +1,63 @@
 /**
-*
-*   ����ṹ��
-*
+ * @file entity.hpp
+ * @brief 实体基类 Entity —— 所有环境实体的公共属性
+ *
+ * Entity 不持有自身 ID（由 civ::Vector 分配和管理），
+ * 但持有类型标签、位置、半径和存活状态。
  */
 
-#include "config.hpp"
+#pragma once
 
+#include <cstdint>
+#include "utils.hpp"
 
-enum class EntityType : uint8_t
-{
-	Default = 0,		// Wall
-	Creature,		// Plant
-	Animal			// Predator, Prey
+// ---------------------------------------------------------------------------
+// EntityType 枚举
+// ---------------------------------------------------------------------------
+enum class EntityType : uint8_t {
+    Wall      = 0,   // 地理隔离
+    Plant     = 1,   // 植物
+    Food      = 2,   // 食物（动物死亡后产生）
+    Predator  = 3,   // 捕食者
+    Prey      = 4,   // 猎物
+    COUNT     = 5    // 类型数量（用于 one-hot 编码）
 };
 
+// ---------------------------------------------------------------------------
+// EntityRef — 跨类型实体引用（类型 + civ::ID）
+// ---------------------------------------------------------------------------
+struct EntityRef {
+    EntityType type   = EntityType::Wall;
+    uint64_t   id     = 0;
+};
 
-class Entity
-{
+// ---------------------------------------------------------------------------
+// Entity 基类
+// ---------------------------------------------------------------------------
+class Entity {
 protected:
-	uint8_t m_id;
-	float m_x, m_y;
-
-	int8_t m_health, m_breed, m_atk;
-	float m_vel_x, m_vel_y;
-	float m_energy, m_reverse;
+    EntityType m_type;
+    float      m_x      = 0.f;
+    float      m_y      = 0.f;
+    float      m_radius = 0.f;
+    bool       m_alive  = true;
 
 public:
-	Entity() :
-		m_id(EntityT	ype::Default), m_x(0.f), m_y(0.f),
-		m_health(Conf::HEALTH_MAX), m_breed(0), m_atk(Conf::ATK_DEFAULT),
-		m_vel_x(0.f), m_vel_y(0.f), m_energe(Conf::ENERGE_MAX), m_reverse(Conf::REVERSE_MAX)
-	{}
+    Entity() : m_type(EntityType::Wall) {}
 
-	Entity(EntityType type, float x, float y) :
-		Entity(),
-		m_id(type), m_x(x), x_y(y)
-	{}
+    Entity(EntityType type, float x, float y, float radius)
+        : m_type(type), m_x(x), m_y(y), m_radius(radius), m_alive(true) {}
 
-	explicit Entity(const Entity& other) :
-		Entity()
-	{
-		m_id = other.m_id;
-		m_x = other.m_x + Conf::ENTITY_NEW_DX;
-		m_y = other.m_y + Conf::ENTITY_NEW_DY;
-	}
+    // --- 访问器 ---
+    EntityType getType()   const { return m_type; }
+    Vec2f      getPos()    const { return {m_x, m_y}; }
+    float      getX()      const { return m_x; }
+    float      getY()      const { return m_y; }
+    float      getRadius() const { return m_radius; }
+    bool       isAlive()   const { return m_alive; }
 
-	void move(float x, float y)
-	{
-
-	}
+    // --- 修改器 ---
+    void setPos(float x, float y) { m_x = x; m_y = y; }
+    void setPos(const Vec2f& p)   { m_x = p.x; m_y = p.y; }
+    void kill()                   { m_alive = false; }
 };
-
-
-class Creature : public Entity
-{
-public:
-	void beAttack(const Creature& other) { m_health -= other.m_atk; }
-
-	inline bool isAlive() { return m_health > 0; }
-};
-
-
-class Animal : public Creature
-{
-public:
-	Animal(const Animal& first, const Animal& second) :
-		Animal()
-	{
-		if (first.m_id != second.m_id)
-			m_health = 0;
-		else
-			m_id = first.m_id;
-	}
-
-	template <typename T>
-	void update(const T& observe) {}
-
-	inline void attack(const Creature& other) { other.beAttack(*this); }
-};
-
-

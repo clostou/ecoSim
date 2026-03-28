@@ -149,24 +149,72 @@ ecoSim (顶层)
 
 
 
+## 2.0 高效列表 `civ::Vector<T>`（`misc/index_vector.hpp`）
+
+### 2.0.1 概述
+
+`misc/index_vector.hpp` 提供了一个高性能的 **稳定 ID 索引列表** `civ::Vector<T>`，专为需要频繁增删、遍历和按 ID 随机访问的场景设计。其核心思想是：
+
+- **数据紧凑存储**：所有有效元素连续存放在 `std::vector<T> data` 的前 `data_size` 个位置，保证遍历时的缓存友好性。
+- **O(1) 删除**：删除时将目标元素与末尾元素交换，然后递减 `data_size`，避免数据搬移。
+- **稳定 ID 访问**：对外暴露的 ID（`civ::ID`，即 `uint64_t`）在元素生命周期内保持不变。通过 `ids[]` 间接映射数组将 ID 映射到当前数据位置，`metadata[]` 则记录反向映射（数据位置 → ID）和操作计数器（用于引用有效性校验）。
+- **槽位复用**：删除后腾出的 `data[data_size]` 位置的 ID 被保留，下次插入时优先复用该 ID 及其槽位，减少内存分配。
+
+### 2.0.2 数据布局
+
+| 成员 | 类型 | 说明 |
+|------|------|------|
+| `data` | `std::vector<T>` | 实际数据，有效元素位于 `[0, data_size)` |
+| `ids` | `std::vector<uint64_t>` | ID → 数据位置的映射表 |
+| `metadata` | `std::vector<SlotMetadata>` | 每个数据位置的元信息：`rid`（反向 ID）、`op_id`（操作计数） |
+| `data_size` | `uint64_t` | 当前有效元素数量 |
+| `op_count` | `uint64_t` | 全局操作计数器，用于引用失效检测 |
+
+### 2.0.3 核心操作复杂度
+
+| 操作 | 方法 | 复杂度 | 说明 |
+|------|------|--------|------|
+| 插入 | `emplace_back` / `push_back` | O(1) 均摊 | 复用已释放槽位；满时扩容 |
+| 删除 | `erase(id)` | O(1) | 与末尾交换 + 更新映射 |
+| ID 访问 | `operator[](id)` | O(1) | 通过 `ids[id]` 间接寻址 |
+| 遍历 | `begin()` / `end()` | O(n) | 连续内存，缓存友好 |
+| 条件删除 | `remove_if(pred)` | O(n) | 遍历中安全删除 |
+
+### 2.0.4 引用类型
+
+- **`Ref<T>`**：轻量级安全引用，持有 `(id, Vector<T>*, validity_id)`。通过对比 `validity_id` 与元数据中的 `op_id` 判断引用是否仍然有效（元素是否被删除后被新元素覆盖）。
+- **`PRef<T>`**：多态安全引用，可通过类型擦除回调访问派生类型的数据，适用于子类存储在基类 `Vector` 中的场景。
+
+### 2.0.5 在实体系统中的应用
+
+在本项目中，`civ::Vector<T>` 用于 **按具体类型分别存储** 各种实体（Wall、Plant、Food、Predator、Prey），实现每个模拟迭代步中的高效增、删、查和遍历。具体设计：
+
+- 每种具体实体类型使用独立的 `civ::Vector<T>` 实例存储，避免虚函数调用和指针间接访问带来的性能开销。
+- 实体的唯一标识由 `civ::ID` 提供，代替原先的 `uint32_t m_id`。
+- `EntityManager` 内部维护多个 `civ::Vector<T>` 实例，对外提供统一的增删查遍历接口。
+- 实体间的跨类型引用（如捕食者引用猎物）通过 `(EntityType, civ::ID)` 二元组实现。
+
+
+
 ## 2.1 实体继承体系
 
 ### 2.1.1 类图
 
+> **设计说明**：实体继承体系采用 **按类型分存** 的策略——每种具体实体类型各自存储在独立的 `civ::Vector<T>` 中。因此类层次结构以数据继承为主（非虚函数多态），各层级的方法实现放在具体子类中。实体不再持有自身 ID（`m_id` 被移除），而是由 `civ::Vector` 分配和管理。
+
 ```mermaid
 classDiagram
     class Entity {
-        #uint32_t m_id
         #EntityType m_type
         #float m_x, m_y
         #float m_radius
         #bool m_alive
-        +getId() uint32_t
         +getType() EntityType
         +getPos() Vec2f
         +getRadius() float
         +isAlive() bool
         +setPos(x, y) void
+        +kill() void
     }
 
     class Creature {
@@ -187,7 +235,7 @@ classDiagram
         #float m_density
         #float m_spread_timer
         #float m_spread_cooldown
-        +update(dt, climate) void
+        +update(dt, light, growth_mod) void
         +getGrowth() float
         +getDensity() float
         +canSpread() bool
@@ -205,7 +253,8 @@ classDiagram
 
     class Wall {
         #float m_width, m_height
-        +getRect() FloatRect
+        +getWidth() float
+        +getHeight() float
         +blocksMovement() bool
         +blocksVision() bool
     }
@@ -221,27 +270,25 @@ classDiagram
         #float m_atk
         #float m_vision_range
         #float m_vision_angle
-        #AgentBrain* m_brain
-        +update(obs, state, env_special, dt) void
-        +attack(other) void
-        +eat(target) void
+        +update(obs, dt) void
+        +attack(target) void
+        +eat(energy) void
         +canBreed() bool
-        +breed(other) Animal*
+        +updateEnergy(dt) void
         +getVelocity() Vec2f
         +getEnergy() float
         +getHunger() float
-        +getState() StateVec
+        +getState() array~float 4~
     }
 
     class Predator {
-        +update(obs, state, env_special, dt) void
-        +attack(prey) void
-        +eat(food) void
+        +Predator()
+        +update(obs, dt) void
     }
 
     class Prey {
-        +update(obs, state, env_special, dt) void
-        +eat(plant) void
+        +Prey()
+        +update(obs, dt) void
     }
 
     Entity <|-- Creature
@@ -252,6 +299,23 @@ classDiagram
     Animal <|-- Predator
     Animal <|-- Prey
 ```
+
+> **实体存储方式**（EntityManager 内部）：
+> ```cpp
+> civ::Vector<Wall>      m_walls;
+> civ::Vector<Plant>     m_plants;
+> civ::Vector<Food>      m_foods;
+> civ::Vector<Predator>  m_predators;
+> civ::Vector<Prey>      m_preys;
+> ```
+> 
+> 每种类型均通过 `civ::ID` 进行 O(1) 增删查，遍历时直接迭代连续内存。跨类型实体引用使用 `EntityRef`：
+> ```cpp
+> struct EntityRef {
+>     EntityType type;
+>     civ::ID    id;
+> };
+> ```
 
 ### 2.1.2 枚举定义
 
@@ -1007,30 +1071,67 @@ Scene::update():
 
 
 
-## 5.3 EntityManager
+## 5.3 EntityManager（基于 `civ::Vector<T>`）
+
+> **设计变更**：使用 `civ::Vector<T>` 替代 `std::vector<std::unique_ptr<Entity>>`，实现 O(1) 增删和缓存友好的遍历。每种具体实体类型独立存储，通过 `EntityRef` 进行跨类型引用。
 
 ```cpp
-class EntityManager {
-    std::vector<std::unique_ptr<Entity>> m_entities;
-    std::vector<Entity*> m_to_remove;
-    std::vector<std::unique_ptr<Entity>> m_to_add;
+#include "index_vector.hpp"
 
-    uint32_t m_next_id;
+// 跨类型实体引用
+struct EntityRef {
+    EntityType type;
+    civ::ID    id;
+};
+
+class EntityManager {
+    // 按类型分存：各类型独立的 civ::Vector
+    civ::Vector<Wall>      m_walls;
+    civ::Vector<Plant>     m_plants;
+    civ::Vector<Food>      m_foods;
+    civ::Vector<Predator>  m_predators;
+    civ::Vector<Prey>      m_preys;
+
+    // 延迟删除队列（类型 + ID）
+    std::vector<EntityRef> m_to_remove;
+
+    // 延迟添加队列（按类型暂存）
+    std::vector<Wall>      m_walls_to_add;
+    std::vector<Plant>     m_plants_to_add;
+    std::vector<Food>      m_foods_to_add;
+    std::vector<Predator>  m_predators_to_add;
+    std::vector<Prey>      m_preys_to_add;
 
 public:
-    Entity* addEntity(std::unique_ptr<Entity> entity);
-    void markForRemoval(Entity* entity);
-    void markForAddition(std::unique_ptr<Entity> entity);
+    // 按类型添加实体，返回分配的 civ::ID
+    template<typename T, typename... Args>
+    civ::ID createEntity(Args&&... args);
+
+    // 标记延迟删除
+    void markForRemoval(EntityRef ref);
+
+    // 标记延迟添加
+    template<typename T>
+    void markForAddition(T&& entity);
+
+    // 执行延迟操作（每帧末尾调用）
     void removeMarked();
     void addPending();
 
     // 按类型遍历
     template<typename T>
-    void forEach(std::function<void(T&)> fn);
+    void forEach(std::function<void(civ::ID, T&)> fn);
+
+    // 按类型访问
+    template<typename T>
+    civ::Vector<T>& getVector();
+
+    template<typename T>
+    const civ::Vector<T>& getVector() const;
 
     // 查询
-    size_t countByType(EntityType type) const;
-    const std::vector<std::unique_ptr<Entity>>& getAll() const;
+    uint64_t countByType(EntityType type) const;
+    uint64_t totalCount() const;
 };
 ```
 
