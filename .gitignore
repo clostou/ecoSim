@@ -1,5 +1,6 @@
 # 忽略构建和生成目录（相对.gitignore文件的路径）
 /out/
+/build/
 /external/*-tmp/
 /external/*-build/
 /external/*-subbuild/
