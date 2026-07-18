@@ -70,7 +70,7 @@ class AttnLSTM(nn.Module):
                                                device=conf.device, dtype=conf.dtype))
 
         self.lstm = nn.LSTM(input_size=conf.hidden_dim+conf.hidden_state_dim+attn_output_dim,
-                            hidden_size=conf.hidden_dim, num_layers=conf.layer_n, batch_first=True,
+                            hidden_size=conf.hidden_dim, num_layers=1, batch_first=True,
                             device=conf.device, dtype=conf.dtype)
 
         self.h0 = torch.zeros(1, conf.hidden_dim,

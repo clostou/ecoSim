@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
-project(testSfml  LANGUAGES CXX)
+project(testSfml LANGUAGES CXX)
 
 include(FetchContent)
 set(FETCHCONTENT_BASE_DIR ${CMAKE_SOURCE_DIR}/external)    # 指定本地共享缓存目录
@@ -23,14 +23,14 @@ set(CMAKE_EXE_LINKER_FLAGS -static)    # or "-static-libgcc -static-libstdc++"
 
 # 将源代码添加到此项目的可执行文件。
 add_executable(${PROJECT_NAME}
-        src/main.cpp
-        src/event.cpp)
+    src/main.cpp
+    src/event.cpp)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
 #target_include_directories(${PROJECT_NAME} PRIVATE ../include)
 target_link_libraries(${PROJECT_NAME} PRIVATE SFML::Graphics)
 
 add_custom_command(
-        TARGET ${PROJECT_NAME}
-        COMMENT "Copy res directory"
-        PRE_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/res $<TARGET_FILE_DIR:${PROJECT_NAME}>/res
+    TARGET ${PROJECT_NAME}
+    COMMENT "Copy res directory"
+    PRE_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/res $<TARGET_FILE_DIR:${PROJECT_NAME}>/res
 )

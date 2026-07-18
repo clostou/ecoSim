@@ -1,6 +1,6 @@
 /**
  * 
- *   �����������ļ�
+ *  智能体配置文件
  * 
 */
 
@@ -32,7 +32,7 @@ struct DefaultAgentConfig
 
 	static constexpr int16_t OBSERVATION_COUNT = 20;
 
-	static void updateRandomState()
+	static inline void updateRandomState()
 	{
 		ENTITY_NEW_DX = RNG::rand();
 		ENTITY_NEW_DY = RNG::rand();

@@ -9,6 +9,11 @@
 .vs/
 .idea/
 .vscode/
+.claude/
+CLAUDE.md
 
 # 忽略Logs
 *.log
+
+# 忽略杂项文件
+/misc/

@@ -158,7 +158,7 @@ G --> I[V*]
 
 类似于下图，非生物环境能够对生态环境的全貌进行实时高质量渲染。渲染基于上帝视角并使用了卡通动画效果，同时还支持模拟控制、视角平移和缩放、系统监视器、展示单个生物概况等功能。
 
-![生态环境实时渲染](./misc/demo_screenshot.png)
+![生态环境实时渲染](./doc/img/demo_screenshot.png)
 
 
 
@@ -428,9 +428,9 @@ A2C算法的训练技巧包括[^2]：
 
 下图则给出了该算法的详细介绍：
 
-![强化学习中的AC架构](./misc/AC_arch_figure.png)
+![强化学习中的AC架构](./doc/img/AC_arch_figure.png)
 
-![A2C算法伪代码](./misc/A2C_alg_figure.png)
+![A2C算法伪代码](./doc/img/A2C_alg_figure.png)
 
 
 

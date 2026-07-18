@@ -19,7 +19,7 @@ class AgentConfig:
     attn_q = 2  # 用于提取观测特征的查询数（每组头的多查询数）
     hidden_state_dim = 16  # 升维后的状态特征维度
     hidden_dim = 32  # 隐状态的维度
-    layer_n = 1  # LSTM块的堆叠数量以及评论员网络的层数
+    layer_n = 1  # 评论员网络的层数
     action_variance = 0.05  # 动作函数的方差（固定值）
 
     def __init__(self, **kwargs):

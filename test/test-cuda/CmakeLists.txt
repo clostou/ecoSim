@@ -3,9 +3,23 @@ project(testCuda LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
 
+include(FetchContent)
+set(FETCHCONTENT_BASE_DIR ${CMAKE_SOURCE_DIR}/external)    # 指定本地共享缓存目录
+set(FETCHCONTENT_FULLY_DISCONNECTED ON)    # 强制使用本地缓存
+FetchContent_Declare(
+    CUTLASS
+    GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+    GIT_TAG v4.5.1   # 使用稳定版本
+    GIT_SHALLOW ON
+)
+set(CUTLASS_ENABLE_EXAMPLES OFF)
+set(CUTLASS_ENABLE_TESTS OFF)
+set(CUTLASS_ENABLE_TOOLS OFF)
+FetchContent_MakeAvailable(CUTLASS)
+
 # 指定CUDA源文件
-add_executable(${PROJECT_NAME} src/helloworld.cu)
+add_executable(${PROJECT_NAME} src/cutlass_test.cu)
 set_property(TARGET ${PROJECT_NAME} PROPERTY CUDA_ARCHITECTURES "75;80;86")    # 设置CUDA架构
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
 #target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -O3>)    # 设置NVCC编译选项
-target_link_libraries(${PROJECT_NAME} CUDA::cublas CUDA::cufft)    # 链接CUDA库 (如 cuBLAS, cuFFT)
+target_link_libraries(${PROJECT_NAME} PRIVATE CUDA::cublas CUDA::cufft CUTLASS)    # 链接CUDA库 (如 cuBLAS, cuFFT)
