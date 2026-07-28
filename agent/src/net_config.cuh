@@ -20,7 +20,8 @@ template <
     int d_h1_ = 12,
     int d_h2_ = 8,
     int d_c_ = 16,
-    int blocks_ = 128
+    int block_size_ = 128,
+    int a2c_steps_ = 10
 >
 struct AttnLstmConfig {
     static constexpr int NET_N = N_;                    /// 网络批量大小
@@ -51,7 +52,7 @@ struct AttnLstmConfig {
             (LSTM_OUTPUT_DIM + 1) * ACT_DIM + 
             ((OBS_DIM + 1) + (CRITIC_HIDDEN_DIM + INNER_DIM + 1) + (CRITIC_HIDDEN_DIM + 1) + 1) * CRITIC_HIDDEN_DIM + 1
         );
-    static constexpr int TOTAL_BYTES =                  /// 网络缓存总量（GQA 输入 + GQA激活 + LSTM 输入/激活 + Output 输入/激活 + Critic 激活）
+    static constexpr int TOTAL_BYTES =                  /// 网络缓存总量（GQA 输入 + GQA 激活 + LSTM 输入/激活 + Output 输入/激活 + Critic 激活）
         NET_N * (
             OBS_DIM * OBS_N + 
             (ATTN_Q_HEADS + 2 * ATTN_KV_HEADS * OBS_N) * ATTN_EMBED_DIM + ATTN_Q_HEADS * ATTN_KV_HEADS * OBS_N + 
@@ -59,12 +60,13 @@ struct AttnLstmConfig {
             LSTM_OUTPUT_DIM + ACT_DIM + 
             3 * CRITIC_HIDDEN_DIM
         );
-    static constexpr int BLOCK_DIM   = blocks_;
-    static constexpr int WARPS       = blocks_ / 32;
+    static constexpr int BLOCK_DIM   = block_size_;
+    static constexpr int WARPS       = block_size_ / 32;
     static constexpr int SMEM_PAD    = 32;              /// 共享内存行尾填充以避免bank conflict
+    static constexpr int A2C_STEPS   = a2c_steps_;      /// A2C 步长（梯度回传窗口）
     static_assert(BLOCK_DIM % 32 == 0, "BLOCK_DIM must be a multiple of 32");
 };
 
-using DefaultConfig = AttnLstmConfig<1, 16, 8, 8, 2, 8, 2, 4, 16, 12, 8, 16, 128>;
+using DefaultConfig = AttnLstmConfig<1, 16, 8, 8, 2, 8, 2, 4, 16, 12, 8, 16, 128, 10>;
 
 }

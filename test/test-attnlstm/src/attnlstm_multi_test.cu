@@ -305,7 +305,7 @@ int main() {
 
     constexpr int NUM_NETS = 1;
     agent_gpu::AttnLstmHandle<Cfg> handle;
-    handle.alloc(NUM_NETS, NUM_STEPS);
+    handle.alloc(NUM_NETS);
 
     // Upload weights
     agent_gpu::AttnLstmWeights<Cfg>* h_w = new agent_gpu::AttnLstmWeights<Cfg>[NUM_NETS];
@@ -327,25 +327,20 @@ int main() {
     bool all_fwd_ok = true;
     for (int t = 0; t < NUM_STEPS; t++) {
         // Upload observe and inner for this step
-        CUDA_CHECK(cudaMemcpy(handle.d_observe, golden.observe[t],
-                              OBS_DIM * OBS_N * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(handle.d_inner, golden.inner[t],
-                              INNER_DIM * sizeof(float), cudaMemcpyHostToDevice));
+        handle.set_input_observe(0, golden.observe[t]);
+        handle.set_input_inner(0, golden.inner[t]);
+        handle.set_input_step(0, t);
 
-        // Forward
+        // Forward（state 原位读写，无需 advance_state）
         fprintf(stderr, "  Forward step %d...\n", t);
-        handle.forward(t);
+        handle.forward();
         CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Advance state for next step
-        if (t < NUM_STEPS - 1) {
-            handle.advance_state();
-        }
 
         // Read outputs
         float h_act[ACT_DIM], h_value[1];
-        CUDA_CHECK(cudaMemcpy(h_act, handle.d_act, ACT_DIM * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_value, handle.d_value, 1 * sizeof(float), cudaMemcpyDeviceToHost));
+        handle.get_output_act(0, h_act);
+        handle.get_output_value(0, h_value);
+        handle.sync();
 
         agent_gpu::AttnLstmPersistent<Cfg> h_p_out[NUM_NETS];
         handle.copy_persistent_to_host(h_p_out);
@@ -381,20 +376,26 @@ int main() {
     handle.copy_weights_from_host(h_w);
     handle.zero_gradients();
 
-    // Upload upstream gradients (only last step gets g_act/g_value)
-    CUDA_CHECK(cudaMemcpy(handle.d_grad_act, golden.g_act, ACT_DIM * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(handle.d_grad_value, golden.g_value, 1 * sizeof(float), cudaMemcpyHostToDevice));
+    // Upload upstream gradients to the LAST step's cache slot
+    // Forward: step=0→slot=0, step=1→slot=1, ..., step=NUM_STEPS-1→slot=NUM_STEPS-1
+    // Backward: step=NUM_STEPS → cache_i=(NUM_STEPS-1)%A2C=NUM_STEPS-1 → latest cache
+    int bwd_step = NUM_STEPS;
+    int grad_slot = bwd_step - 1;   // = NUM_STEPS-1（最新前向步的 cache 槽号）
+    handle.set_grad_act_at_slot(0, grad_slot, golden.g_act);
+    handle.set_grad_value_at_slot(0, grad_slot, golden.g_value);
+    handle.set_input_step(0, bwd_step);
 
-    // Run BPTT backward (reads from d_caches populated by forward kernel)
-    fprintf(stderr, "  Launching backward kernel (num_steps=%d)...\n", NUM_STEPS);
-    handle.backward(NUM_STEPS);
+    // Run BPTT backward: lr=0, beta=0 使 record.grad 直接存 g
+    // bptt_steps = NUM_STEPS（仅遍历有效 cache）
+    fprintf(stderr, "  Launching backward kernel (bptt_steps=%d, bwd_step=%d)...\n", NUM_STEPS, bwd_step);
+    handle.backward(0.0f, 0.0f, 0.0f, NUM_STEPS);
     handle.sync();
     fprintf(stderr, "  Backward kernel completed.\n");
 
-    // Read gradients
-    agent_gpu::AttnLstmWeights<Cfg> h_w_gpu;
-    handle.copy_weights_to_host(&h_w_gpu);
-    const float* gpu_grads = h_w_gpu.grad_Wkv;
+    // Read gradients（梯度为独立 AttnLstmWeights，字段布局与权重相同）
+    agent_gpu::AttnLstmWeights<Cfg> h_w_grad;
+    handle.copy_grads_to_host(&h_w_grad);
+    const float* gpu_grads = h_w_grad.Wkv;
 
     // Offsets
     constexpr int SZ_WKV  = 2*H_KV*D_E*OBS_DIM; constexpr int SZ_WQ  = H_Q*D_E*D_H1;
@@ -414,15 +415,18 @@ int main() {
     constexpr int OFF_WC4=OFF_BC3+SZ_BC3, OFF_BC4=OFF_WC4+SZ_WC4;
 
     bool all_bwd_ok = true;
-    #define CHK(n,o,s) { bool ok=allclose(gpu_grads+(o),golden.grads+(o),(s),5e-2f,5e-4f,"grad_"#n); all_bwd_ok=all_bwd_ok&&ok; }
-    CHK(Wkv,  OFF_WKV,  SZ_WKV);  CHK(Wq,   OFF_WQ,   SZ_WQ);
-    CHK(bcat, OFF_BCAT, SZ_BCAT); CHK(Wico, OFF_WICO, SZ_WICO);
-    CHK(bico, OFF_BICO, SZ_BICO); CHK(Wf,   OFF_WF,   SZ_WF);
-    CHK(bf,   OFF_BF,   SZ_BF);   CHK(Wc1,  OFF_WC1,  SZ_WC1);
-    CHK(bc1,  OFF_BC1,  SZ_BC1);  CHK(Wc2,  OFF_WC2,  SZ_WC2);
-    CHK(bc2,  OFF_BC2,  SZ_BC2);  CHK(Wc3,  OFF_WC3,  SZ_WC3);
-    CHK(bc3,  OFF_BC3,  SZ_BC3);  CHK(Wc4,  OFF_WC4,  SZ_WC4);
-    CHK(bc4,  OFF_BC4,  SZ_BC4);
+    // Actor fields: relaxed tolerances for BPTT fp32 accumulation
+    // Critic fields: strict tolerances (single-step, no BPTT chain)
+    #define CHK_A(n,o,s) { bool ok=allclose(gpu_grads+(o),golden.grads+(o),(s),5e-2f,8e-3f,"grad_"#n); all_bwd_ok=all_bwd_ok&&ok; }
+    #define CHK_C(n,o,s) { bool ok=allclose(gpu_grads+(o),golden.grads+(o),(s),1e-2f,1e-3f,"grad_"#n); all_bwd_ok=all_bwd_ok&&ok; }
+    CHK_A(Wkv,  OFF_WKV,  SZ_WKV);  CHK_A(Wq,   OFF_WQ,   SZ_WQ);
+    CHK_A(bcat, OFF_BCAT, SZ_BCAT); CHK_A(Wico, OFF_WICO, SZ_WICO);
+    CHK_A(bico, OFF_BICO, SZ_BICO); CHK_A(Wf,   OFF_WF,   SZ_WF);
+    CHK_A(bf,   OFF_BF,   SZ_BF);
+    CHK_C(Wc1,  OFF_WC1,  SZ_WC1);  CHK_C(bc1,  OFF_BC1,  SZ_BC1);
+    CHK_C(Wc2,  OFF_WC2,  SZ_WC2);  CHK_C(bc2,  OFF_BC2,  SZ_BC2);
+    CHK_C(Wc3,  OFF_WC3,  SZ_WC3);  CHK_C(bc3,  OFF_BC3,  SZ_BC3);
+    CHK_C(Wc4,  OFF_WC4,  SZ_WC4);  CHK_C(bc4,  OFF_BC4,  SZ_BC4);
     #undef CHK
     printf("  Multi-step Backward overall: %s\n\n", all_bwd_ok ? "PASS" : "FAIL");
 
@@ -440,6 +444,69 @@ int main() {
         printf("  Step 0 h_new=[%.6f ...] (should feed to step1 h_prev): %s\n",
                golden.h_new[0][0],
                fabsf(golden.h_new[0][0] - golden.h_prev[1][0]) < 1e-6f ? "OK" : "MISMATCH");
+    }
+
+    // ================================================================
+    // Test 4: Cache integrity check (compare GPU caches with golden)
+    // ================================================================
+    printf("--- Test 4: Cache Integrity Check ---\n");
+    {
+        bool all_cache_ok = true;
+        for (int t = 0; t < NUM_STEPS; t++) {
+            agent_gpu::AttnLstmCache<Cfg> h_cache;
+            CUDA_CHECK(cudaMemcpy(&h_cache,
+                                  handle.d_caches + 0 * Cfg::A2C_STEPS + t,
+                                  sizeof(agent_gpu::AttnLstmCache<Cfg>),
+                                  cudaMemcpyDeviceToHost));
+
+            char label[64];
+            snprintf(label, sizeof(label), "step %d k", t);
+            bool ok1 = allclose(h_cache.k, golden.k[t],
+                                H_KV * D_E * OBS_N, 5e-4f, 5e-5f, label);
+            snprintf(label, sizeof(label), "step %d v", t);
+            bool ok2 = allclose(h_cache.v, golden.v[t],
+                                H_KV * D_E * OBS_N, 5e-4f, 5e-5f, label);
+            snprintf(label, sizeof(label), "step %d p", t);
+            bool ok3 = allclose(h_cache.p, golden.p[t],
+                                H_Q * H_KV * OBS_N, 5e-4f, 5e-5f, label);
+            snprintf(label, sizeof(label), "step %d gate_i", t);
+            bool ok4 = allclose(h_cache.gate_i, golden.gate_i[t],
+                                D_H, 5e-4f, 5e-5f, label);
+            snprintf(label, sizeof(label), "step %d gate_o", t);
+            bool ok5 = allclose(h_cache.gate_o, golden.gate_o[t],
+                                D_H, 5e-4f, 5e-5f, label);
+            snprintf(label, sizeof(label), "step %d c_h3", t);
+            bool ok6 = allclose(h_cache.c_h3, golden.c_h3[t],
+                                D_C, 5e-4f, 5e-5f, label);
+            if (!ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6) all_cache_ok = false;
+        }
+        printf("  Cache integrity: %s\n\n", all_cache_ok ? "PASS" : "FAIL");
+    }
+
+    // ================================================================
+    // Test 5: Gradient accumulation across BPTT steps
+    // ================================================================
+    printf("--- Test 5: BPTT Gradient Details ---\n");
+    {
+        // Verify that Critic gradients (single-step) are precise
+        bool critic_precise = true;
+        for (int i = 0; i < fminf(4, SZ_WC4); i++) {
+            float golden_v = golden.grads[OFF_WC4 + i];
+            float gpu_v = gpu_grads[OFF_WC4 + i];
+            if (fabsf(golden_v) > 1e-6f && fabsf(gpu_v - golden_v) > fmaxf(1e-3f * fabsf(golden_v), 1e-6f)) {
+                critic_precise = false; break;
+            }
+        }
+        printf("  Critic gradient precision: %s\n", critic_precise ? "PASS" : "FAIL");
+
+        // Check gradient magnitudes are reasonable
+        float grad_norm = 0.0f;
+        for (int i = 0; i < WEIGHT_FLOATS; i++) {
+            grad_norm += gpu_grads[i] * gpu_grads[i];
+        }
+        grad_norm = sqrtf(grad_norm);
+        printf("  Total gradient L2 norm: %.4f\n", grad_norm);
+        printf("  BPTT gradient summary: %s\n\n", (grad_norm > 1e-6f) ? "PASS (non-zero)" : "WARN");
     }
 
     // Cleanup

@@ -30,7 +30,8 @@ function(setup_test_target TARGET_NAME SRC_FILE)
     )
     target_compile_options(${TARGET_NAME} PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
-        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+        # nvcc -O3 maps to host /O2, which conflicts with Debug's /Od /RTC1
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-O3>
     )
     target_link_libraries(${TARGET_NAME} PRIVATE
         CUDA::cublas

@@ -1,8 +1,18 @@
 /**
  * @file net_host.cuh
- * @brief AttnLSTM Actor + FCN Critic 的host端管理器
+ * @brief AttnLSTM Actor + FCN Critic 的 host 端管理器
  *
- * 管理device内存分配/释放、权重初始化、kernel启动、梯度更新。
+ * 管理四区全局内存（见 doc/attn-lstm-implementation.md "全局内存布局"）：
+ *   Gmem1: d_records  [num_networks]            = AttnLstmNetRecord{state, weight, grad}
+ *   Gmem2: d_caches   [num_networks*A2C_STEPS]  = AttnLstmCache（环形）
+ *   Gmem3: d_input    [buf_length]              = AttnLstmInput（CPU→GPU，固定）
+ *   Gmem4: d_output   [buf_length]              = AttnLstmOutput（GPU→CPU，固定）
+ *
+ * 设计要点：
+ * - state 在 Gmem1 记录内原位读写（前向），故无 d_persistent_out / advance_state。
+ * - cache 环形：前向写槽 = input.step % A2C_STEPS；反向读起点同式（由 kernel 计算）。
+ * - 权重/梯度分离：weight 只读，grad 独立同型 AttnLstmWeights。
+ *
  * 设计模式参考 test/test-cutlass/src/fnn_host.cuh:FNNHandle
  */
 
@@ -20,46 +30,43 @@ namespace agent_gpu {
 
 template <typename Config = DefaultConfig>
 struct AttnLstmHandle {
-    static constexpr int OBS_N    = Config::OBS_N;
-    static constexpr int OBS_DIM  = Config::OBS_DIM;
+    static constexpr int OBS_N     = Config::OBS_N;
+    static constexpr int OBS_DIM   = Config::OBS_DIM;
     static constexpr int INNER_DIM = Config::INNER_DIM;
-    static constexpr int ACT_DIM  = Config::ACT_DIM;
-    static constexpr int D_H      = Config::LSTM_HIDDEN_DIM;
-    static constexpr int BLK      = Config::BLOCK_DIM;
+    static constexpr int ACT_DIM   = Config::ACT_DIM;
+    static constexpr int D_H       = Config::LSTM_HIDDEN_DIM;
+    static constexpr int A2C_STEPS = Config::A2C_STEPS;
+    static constexpr int BLK       = Config::BLOCK_DIM;
 
     int num_networks;
-    int num_caches_per_net;
+    int buf_length;   // Gmem3/4 通信缓冲容量（固定，≥ num_networks）
 
-    // Device memory
-    AttnLstmWeights<Config>*  d_weights;
-    AttnLstmPersistent<Config>* d_persistent;
-    AttnLstmPersistent<Config>* d_persistent_out;
-    float* d_observe;
-    float* d_inner;
-    float* d_act;
-    float* d_value;
-    float* d_grad_act;
-    float* d_grad_value;
-    AttnLstmCache<Config>* d_caches;
+    // ---- Device memory（四区） ----
+    AttnLstmNetRecord<Config>*  d_records;   // Gmem1 [num_networks]
+    AttnLstmCache<Config>*      d_caches;    // Gmem2 [num_networks * A2C_STEPS]
+    AttnLstmInput<Config>*      d_input;     // Gmem3 [buf_length]
+    AttnLstmOutput<Config>*     d_output;    // Gmem4 [buf_length]
 
     cudaStream_t stream;
 
-    // ================================================================
-    // 分配
-    // ================================================================
-    void alloc(int num_nets, int caches_per_net = 1) {
+    // 记录内偏移（Gmem1 打包：[state | weight | grad]）
+    static constexpr size_t STATE_OFF  = 0;
+    static constexpr size_t WEIGHT_OFF = sizeof(AttnLstmPersistent<Config>);
+    static constexpr size_t GRAD_OFF   = WEIGHT_OFF + sizeof(AttnLstmWeights<Config>);
+    static constexpr size_t RECORD_SZ  = sizeof(AttnLstmNetRecord<Config>);
+
+    /// 分配内存（num_nets 网络；buf_len 通信缓冲容量，默认 = num_nets）
+    void alloc(int num_nets, int buf_len = -1) {
         num_networks = num_nets;
-        num_caches_per_net = caches_per_net;
+        buf_length   = (buf_len < 0) ? num_nets : buf_len;
+        if (buf_length < num_networks) buf_length = num_networks;
 
         cudaStreamCreate(&stream);
 
-        size_t wbytes   = num_nets * sizeof(AttnLstmWeights<Config>);
-        size_t pbytes   = num_nets * sizeof(AttnLstmPersistent<Config>);
-        size_t obytes   = num_nets * OBS_DIM * OBS_N * sizeof(float);
-        size_t ibytes   = num_nets * INNER_DIM * sizeof(float);
-        size_t abytes   = num_nets * ACT_DIM * sizeof(float);
-        size_t vbytes   = num_nets * 1 * sizeof(float);
-        size_t cbytes   = num_nets * caches_per_net * sizeof(AttnLstmCache<Config>);
+        size_t rbytes = num_networks * sizeof(AttnLstmNetRecord<Config>);
+        size_t cbytes = num_networks * A2C_STEPS * sizeof(AttnLstmCache<Config>);
+        size_t ibytes = buf_length   * sizeof(AttnLstmInput<Config>);
+        size_t obytes = buf_length   * sizeof(AttnLstmOutput<Config>);
 
         auto check = [](cudaError_t e, const char* label) {
             if (e != cudaSuccess) {
@@ -68,35 +75,172 @@ struct AttnLstmHandle {
             }
         };
 
-        check(cudaMalloc(&d_weights,        wbytes), "weights");
-        check(cudaMalloc(&d_persistent,     pbytes), "persistent");
-        check(cudaMalloc(&d_persistent_out, pbytes), "persistent_out");
-        check(cudaMalloc(&d_observe,        obytes), "observe");
-        check(cudaMalloc(&d_inner,          ibytes), "inner");
-        check(cudaMalloc(&d_act,            abytes), "act");
-        check(cudaMalloc(&d_value,          vbytes), "value");
-        check(cudaMalloc(&d_grad_act,       abytes), "grad_act");
-        check(cudaMalloc(&d_grad_value,     vbytes), "grad_value");
-        check(cudaMalloc(&d_caches,         cbytes), "caches");
+        check(cudaMalloc(&d_records, rbytes), "records");
+        check(cudaMalloc(&d_caches,  cbytes), "caches");
+        check(cudaMalloc(&d_input,   ibytes), "input");
+        check(cudaMalloc(&d_output,  obytes), "output");
 
-        // Zero-initialize weights, gradients, persistent state
-        check(cudaMemset(d_weights,    0, wbytes), "memset weights");
-        check(cudaMemset(d_persistent, 0, pbytes), "memset persistent");
+        check(cudaMemset(d_records, 0, rbytes), "memset records");
     }
 
+    /// 释放内存
     void free() {
-        cudaFree(d_weights);
-        cudaFree(d_persistent);
-        cudaFree(d_persistent_out);
-        cudaFree(d_observe);
-        cudaFree(d_inner);
-        cudaFree(d_act);
-        cudaFree(d_value);
-        cudaFree(d_grad_act);
-        cudaFree(d_grad_value);
+        cudaFree(d_records);
         cudaFree(d_caches);
+        cudaFree(d_input);
+        cudaFree(d_output);
         cudaStreamDestroy(stream);
     }
+
+    // ================================================================
+    // 权重 / 梯度 / 状态 拷贝（Gmem1）
+    // ================================================================
+
+    /// Host → Device 权重（写入各 record.weight）
+    void copy_weights_from_host(const AttnLstmWeights<Config>* h_weights) {
+        for (int n = 0; n < num_networks; ++n) {
+            char* dst = reinterpret_cast<char*>(d_records) + n * RECORD_SZ + WEIGHT_OFF;
+            cudaMemcpyAsync(dst, h_weights + n, sizeof(AttnLstmWeights<Config>),
+                            cudaMemcpyHostToDevice, stream);
+        }
+        cudaStreamSynchronize(stream);
+    }
+
+    /// Device → Host 权重（从各 record.weight 读）
+    void copy_weights_to_host(AttnLstmWeights<Config>* h_weights) {
+        for (int n = 0; n < num_networks; ++n) {
+            const char* src = reinterpret_cast<const char*>(d_records) + n * RECORD_SZ + WEIGHT_OFF;
+            cudaMemcpyAsync(h_weights + n, src, sizeof(AttnLstmWeights<Config>),
+                            cudaMemcpyDeviceToHost, stream);
+        }
+        cudaStreamSynchronize(stream);
+    }
+
+    /// Device → Host 梯度（从各 record.grad 读）
+    void copy_grads_to_host(AttnLstmWeights<Config>* h_grads) {
+        for (int n = 0; n < num_networks; ++n) {
+            const char* src = reinterpret_cast<const char*>(d_records) + n * RECORD_SZ + GRAD_OFF;
+            cudaMemcpyAsync(h_grads + n, src, sizeof(AttnLstmWeights<Config>),
+                            cudaMemcpyDeviceToHost, stream);
+        }
+        cudaStreamSynchronize(stream);
+    }
+
+    /// Host → Device 持久状态（写入各 record.state）
+    void copy_persistent_from_host(const AttnLstmPersistent<Config>* h_persistent) {
+        for (int n = 0; n < num_networks; ++n) {
+            char* dst = reinterpret_cast<char*>(d_records) + n * RECORD_SZ + STATE_OFF;
+            cudaMemcpyAsync(dst, h_persistent + n, sizeof(AttnLstmPersistent<Config>),
+                            cudaMemcpyHostToDevice, stream);
+        }
+        cudaStreamSynchronize(stream);
+    }
+
+    /// Device → Host 持久状态（从各 record.state 读；前向原位写回后的 h_new/c_new）
+    void copy_persistent_to_host(AttnLstmPersistent<Config>* h_persistent) {
+        for (int n = 0; n < num_networks; ++n) {
+            const char* src = reinterpret_cast<const char*>(d_records) + n * RECORD_SZ + STATE_OFF;
+            cudaMemcpyAsync(h_persistent + n, src, sizeof(AttnLstmPersistent<Config>),
+                            cudaMemcpyDeviceToHost, stream);
+        }
+        cudaStreamSynchronize(stream);
+    }
+
+    // ================================================================
+    // 输入 / 输出（Gmem3 / Gmem4）
+    // ================================================================
+
+    inline char* input_ptr(int net) {
+        return reinterpret_cast<char*>(d_input) + net * sizeof(AttnLstmInput<Config>);
+    }
+    inline const char* output_ptr(int net) const {
+        return reinterpret_cast<const char*>(d_output) + net * sizeof(AttnLstmOutput<Config>);
+    }
+
+    /// 设置网络 net 的 observe（Gmem3）
+    void set_input_observe(int net, const float* host) {
+        size_t off = offsetof(AttnLstmInput<Config>, observe);
+        cudaMemcpyAsync(input_ptr(net) + off, host,
+                        OBS_DIM * OBS_N * sizeof(float), cudaMemcpyHostToDevice, stream);
+    }
+    /// 设置网络 net 的 inner
+    void set_input_inner(int net, const float* host) {
+        size_t off = offsetof(AttnLstmInput<Config>, inner);
+        cudaMemcpyAsync(input_ptr(net) + off, host,
+                        INNER_DIM * sizeof(float), cudaMemcpyHostToDevice, stream);
+    }
+    /// 设置网络 net 的当前步 Actor 梯度（写入 grad_act[0:ACT_DIM]）
+    void set_grad_act(int net, const float* host) {
+        size_t off = offsetof(AttnLstmInput<Config>, grad_act);
+        cudaMemcpyAsync(input_ptr(net) + off, host,
+                        ACT_DIM * sizeof(float), cudaMemcpyHostToDevice, stream);
+    }
+    /// 设置网络 net 的 slot 步 Actor 梯度（写入 grad_act[slot*ACT_DIM:(slot+1)*ACT_DIM]）
+    void set_grad_act_at_slot(int net, int slot, const float* host) {
+        size_t off = offsetof(AttnLstmInput<Config>, grad_act) + slot * ACT_DIM * sizeof(float);
+        cudaMemcpyAsync(input_ptr(net) + off, host,
+                        ACT_DIM * sizeof(float), cudaMemcpyHostToDevice, stream);
+    }
+    /// 设置网络 net 的当前步 Critic 梯度（写入 grad_value[0:1]）
+    void set_grad_value(int net, const float* host) {
+        size_t off = offsetof(AttnLstmInput<Config>, grad_value);
+        cudaMemcpyAsync(input_ptr(net) + off, host,
+                        1 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    }
+    /// 设置网络 net 的 slot 步 Critic 梯度（写入 grad_value[slot]）
+    void set_grad_value_at_slot(int net, int slot, const float* host) {
+        size_t off = offsetof(AttnLstmInput<Config>, grad_value) + slot * sizeof(float);
+        cudaMemcpyAsync(input_ptr(net) + off, host,
+                        1 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    }
+    /// 设置网络 net 的内时间步
+    void set_input_step(int net, int step) {
+        size_t off = offsetof(AttnLstmInput<Config>, step);
+        cudaMemcpyAsync(input_ptr(net) + off, &step, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    }
+    /// 整块设置网络 net 的输入
+    void copy_input_from_host(int net, const AttnLstmInput<Config>* host) {
+        cudaMemcpyAsync(input_ptr(net), host, sizeof(AttnLstmInput<Config>),
+                        cudaMemcpyHostToDevice, stream);
+    }
+
+    /// 读取网络 net 的 Actor 输出 act
+    void get_output_act(int net, float* host) {
+        size_t off = offsetof(AttnLstmOutput<Config>, act);
+        cudaMemcpyAsync(host, output_ptr(net) + off,
+                        ACT_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    }
+    /// 读取网络 net 的 Critic 输出 value
+    void get_output_value(int net, float* host) {
+        size_t off = offsetof(AttnLstmOutput<Config>, value);
+        cudaMemcpyAsync(host, output_ptr(net) + off,
+                        1 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    }
+    /// 整块读取网络 net 的输出
+    void copy_output_to_host(int net, AttnLstmOutput<Config>* host) {
+        cudaMemcpyAsync(host, output_ptr(net), sizeof(AttnLstmOutput<Config>),
+                        cudaMemcpyDeviceToHost, stream);
+    }
+
+    // ================================================================
+    // 梯度清零 / SGD
+    // ================================================================
+
+    /// 梯度清零（各 record.grad）
+    void zero_gradients() {
+        for (int n = 0; n < num_networks; ++n) {
+            char* base = reinterpret_cast<char*>(d_records) + n * RECORD_SZ + GRAD_OFF;
+            cudaMemsetAsync(base, 0, sizeof(AttnLstmWeights<Config>), stream);
+        }
+        cudaStreamSynchronize(stream);
+    }
+
+    /// 同步
+    void sync() { cudaStreamSynchronize(stream); }
+
+    // 注：SGD 更新（带动量 + 解耦 L2）已在反向 kernel 末尾流式完成，
+    //     故 host 端不再提供 apply_gradients_sgd。
 
     // ================================================================
     // 权重初始化（Xavier normal）
@@ -125,28 +269,18 @@ struct AttnLstmHandle {
                 }
             };
 
-            int Wkv_size  = 2 * Config::ATTN_KV_HEADS * Config::ATTN_EMBED_DIM * Config::OBS_DIM;
-            int Wq_size   = Config::ATTN_Q_HEADS * Config::ATTN_EMBED_DIM * Config::LSTM_QUERY_DIM;
-            int bcat_size = Config::ATTN_Q_HEADS * Config::ATTN_EMBED_DIM;
-            int Wico_size = 3 * Config::LSTM_HIDDEN_DIM * Config::LSTM_INPUT_DIM;
-            int bico_size = 3 * Config::LSTM_HIDDEN_DIM;
-            int Wf_size   = Config::LSTM_OUTPUT_DIM * Config::ACT_DIM;
-            int Wc1_size  = Config::CRITIC_HIDDEN_DIM * Config::OBS_DIM;
-            int Wc2_size  = Config::CRITIC_HIDDEN_DIM * (Config::CRITIC_HIDDEN_DIM + Config::INNER_DIM);
-            int Wc3_size  = Config::CRITIC_HIDDEN_DIM * Config::CRITIC_HIDDEN_DIM;
-            int Wc4_size  = 1 * Config::CRITIC_HIDDEN_DIM;
+            xavier_fill(w.Wkv,  2 * Config::ATTN_KV_HEADS * Config::ATTN_EMBED_DIM * Config::OBS_DIM, Config::OBS_DIM);
+            xavier_fill(w.Wq,   Config::ATTN_Q_HEADS * Config::ATTN_EMBED_DIM * Config::LSTM_QUERY_DIM, Config::LSTM_QUERY_DIM);
+            xavier_fill(w.Wico, 3 * Config::LSTM_HIDDEN_DIM * Config::LSTM_INPUT_DIM, Config::LSTM_INPUT_DIM);
+            xavier_fill(w.Wf,   Config::LSTM_OUTPUT_DIM * Config::ACT_DIM, Config::LSTM_OUTPUT_DIM);
+            xavier_fill(w.Wc1,  Config::CRITIC_HIDDEN_DIM * Config::OBS_DIM, Config::OBS_DIM);
+            xavier_fill(w.Wc2,  Config::CRITIC_HIDDEN_DIM * (Config::CRITIC_HIDDEN_DIM + Config::INNER_DIM),
+                        Config::CRITIC_HIDDEN_DIM + Config::INNER_DIM);
+            xavier_fill(w.Wc3,  Config::CRITIC_HIDDEN_DIM * Config::CRITIC_HIDDEN_DIM, Config::CRITIC_HIDDEN_DIM);
+            xavier_fill(w.Wc4,  1 * Config::CRITIC_HIDDEN_DIM, Config::CRITIC_HIDDEN_DIM);
 
-            xavier_fill(w.Wkv,  Wkv_size,  Config::OBS_DIM);
-            xavier_fill(w.Wq,   Wq_size,   Config::LSTM_QUERY_DIM);
-            xavier_fill(w.Wico, Wico_size, Config::LSTM_INPUT_DIM);
-            xavier_fill(w.Wf,   Wf_size,   Config::LSTM_OUTPUT_DIM);
-            xavier_fill(w.Wc1,  Wc1_size,  Config::OBS_DIM);
-            xavier_fill(w.Wc2,  Wc2_size,  Config::CRITIC_HIDDEN_DIM + Config::INNER_DIM);
-            xavier_fill(w.Wc3,  Wc3_size,  Config::CRITIC_HIDDEN_DIM);
-            xavier_fill(w.Wc4,  Wc4_size,  Config::CRITIC_HIDDEN_DIM);
-
-            small_rand(w.bcat, bcat_size);
-            small_rand(w.bico, bico_size);
+            small_rand(w.bcat, Config::ATTN_Q_HEADS * Config::ATTN_EMBED_DIM);
+            small_rand(w.bico, 3 * Config::LSTM_HIDDEN_DIM);
             small_rand(w.bf,   Config::ACT_DIM);
             small_rand(w.bc1,  Config::CRITIC_HIDDEN_DIM);
             small_rand(w.bc2,  Config::CRITIC_HIDDEN_DIM);
@@ -154,150 +288,36 @@ struct AttnLstmHandle {
             small_rand(w.bc4,  1);
         }
 
-        cudaMemcpyAsync(d_weights, h_weights,
-                        num_networks * sizeof(AttnLstmWeights<Config>),
-                        cudaMemcpyHostToDevice, stream);
-        cudaStreamSynchronize(stream);
+        copy_weights_from_host(h_weights);
         delete[] h_weights;
     }
 
     // ================================================================
-    // Host ↔ Device 权重拷贝
+    // Kernel 启动
     // ================================================================
-    void copy_weights_from_host(const AttnLstmWeights<Config>* h_weights) {
-        cudaMemcpyAsync(d_weights, h_weights,
-                        num_networks * sizeof(AttnLstmWeights<Config>),
-                        cudaMemcpyHostToDevice, stream);
-        cudaStreamSynchronize(stream);
-    }
 
-    void copy_weights_to_host(AttnLstmWeights<Config>* h_weights) {
-        cudaMemcpyAsync(h_weights, d_weights,
-                        num_networks * sizeof(AttnLstmWeights<Config>),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-    }
-
-    // ================================================================
-    // 持久状态操作
-    // ================================================================
-    void copy_persistent_from_host(const AttnLstmPersistent<Config>* h_persistent) {
-        cudaMemcpyAsync(d_persistent, h_persistent,
-                        num_networks * sizeof(AttnLstmPersistent<Config>),
-                        cudaMemcpyHostToDevice, stream);
-        cudaStreamSynchronize(stream);
-    }
-
-    void copy_persistent_to_host(AttnLstmPersistent<Config>* h_persistent) {
-        cudaMemcpyAsync(h_persistent, d_persistent_out,
-                        num_networks * sizeof(AttnLstmPersistent<Config>),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-    }
-
-    // ================================================================
-    // 零梯度
-    // ================================================================
-    void zero_gradients() {
-        // 计算梯度区偏移
-        constexpr int GRAD_OFFSET_FLOATS =
-            2 * Config::ATTN_KV_HEADS * Config::ATTN_EMBED_DIM * Config::OBS_DIM
-            + Config::ATTN_Q_HEADS * Config::ATTN_EMBED_DIM * Config::LSTM_QUERY_DIM
-            + Config::ATTN_Q_HEADS * Config::ATTN_EMBED_DIM
-            + 3 * Config::LSTM_HIDDEN_DIM * Config::LSTM_INPUT_DIM
-            + 3 * Config::LSTM_HIDDEN_DIM
-            + Config::LSTM_OUTPUT_DIM * Config::ACT_DIM
-            + Config::ACT_DIM
-            + Config::CRITIC_HIDDEN_DIM * Config::OBS_DIM
-            + Config::CRITIC_HIDDEN_DIM
-            + Config::CRITIC_HIDDEN_DIM * (Config::CRITIC_HIDDEN_DIM + Config::INNER_DIM)
-            + Config::CRITIC_HIDDEN_DIM
-            + Config::CRITIC_HIDDEN_DIM * Config::CRITIC_HIDDEN_DIM
-            + Config::CRITIC_HIDDEN_DIM
-            + 1 * Config::CRITIC_HIDDEN_DIM
-            + 1;
-
-        size_t grad_offset_bytes = GRAD_OFFSET_FLOATS * sizeof(float);
-        size_t grad_bytes = sizeof(AttnLstmWeights<Config>) - grad_offset_bytes;
-
-        for (int n = 0; n < num_networks; ++n) {
-            char* base = reinterpret_cast<char*>(d_weights) +
-                         n * sizeof(AttnLstmWeights<Config>) + grad_offset_bytes;
-            cudaMemsetAsync(base, 0, grad_bytes, stream);
-        }
-        cudaStreamSynchronize(stream);
-    }
-
-    // ================================================================
-    // 前向启动
-    // ================================================================
-    void forward(int cache_step = 0) {
+    /// 前向：每步执行；cache 环写槽 = d_input.step % A2C_STEPS（kernel 内计算）
+    void forward() {
         dim3 block(BLK);
         dim3 grid(num_networks);
-        size_t smem = SmemLayout<Config>::TOTAL * sizeof(float);
-
+        size_t smem = SmemLayoutFwd<Config>::TOTAL * sizeof(float);
         attn_lstm_forward_kernel<Config>
-            <<<grid, block, smem, stream>>>(
-                d_weights, d_persistent, d_persistent_out,
-                d_observe, d_inner,
-                d_act, d_value,
-                d_caches + cache_step);
+            <<<grid, block, smem, stream>>>(d_records, d_input, d_output, d_caches);
     }
 
-    // ================================================================
-    // 反向启动
-    // ================================================================
-    void backward(int num_steps = 1) {
+    /// 反向：每步执行；Critic 每步，Actor 触发时遍历窗口（kernel 内）；
+    /// 末尾流式 SGD（v=β·v+g; w=w·(1−lr·γ)+lr·v）
+    /// @param bptt_steps BPTT 回传步数（-1 表示使用 A2C_STEPS）
+    void backward(float lr = 1e-5f, float beta = 0.9f, float gamma = 0.0f,
+                  int bptt_steps = -1) {
+        if (bptt_steps < 0) bptt_steps = A2C_STEPS;
         dim3 block(BLK);
         dim3 grid(num_networks);
-        size_t smem = SmemLayout<Config>::TOTAL * sizeof(float);
-
+        size_t smem = SmemLayoutBwd<Config>::TOTAL * sizeof(float);
         attn_lstm_backward_kernel<Config>
-            <<<grid, block, smem, stream>>>(
-                d_weights, d_grad_act, d_grad_value,
-                d_caches, num_steps);
-    }
-
-    // ================================================================
-    // 推进持久状态（多步forward时调用：d_persistent_out → d_persistent）
-    // ================================================================
-    void advance_state() {
-        size_t pbytes = num_networks * sizeof(AttnLstmPersistent<Config>);
-        cudaMemcpyAsync(d_persistent, d_persistent_out, pbytes,
-                        cudaMemcpyDeviceToDevice, stream);
-        cudaStreamSynchronize(stream);
-    }
-
-    // ================================================================
-    // 同步
-    // ================================================================
-    void sync() {
-        cudaStreamSynchronize(stream);
-    }
-
-    // ================================================================
-    // SGD更新（host端实现）
-    // ================================================================
-    void apply_gradients_sgd(float lr) {
-        AttnLstmWeights<Config>* h = new AttnLstmWeights<Config>[num_networks];
-        copy_weights_to_host(h);
-
-        for (int n = 0; n < num_networks; ++n) {
-            auto& w = h[n];
-
-            // 所有权重数组成员（不含梯度区）的迭代更新
-            int num_weight_floats = sizeof(AttnLstmWeights<Config>) / sizeof(float) / 2;
-            float* weights = reinterpret_cast<float*>(&w);
-            float* grads   = weights + num_weight_floats;
-
-            for (int i = 0; i < num_weight_floats; ++i) {
-                weights[i] -= lr * grads[i];
-            }
-        }
-
-        copy_weights_from_host(h);
-        delete[] h;
+            <<<grid, block, smem, stream>>>(d_records, d_input, d_caches,
+                                            lr, beta, gamma, bptt_steps);
     }
 };
 
-} // namespace agent_gpu
+}  // namespace agent_gpu

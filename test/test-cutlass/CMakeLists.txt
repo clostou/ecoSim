@@ -32,7 +32,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 # ---- NVCC flags ----
 target_compile_options(${PROJECT_NAME} PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    # nvcc -O3 maps to host /O2, which conflicts with Debug's /Od /RTC1
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-O3>
     $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
 )
 

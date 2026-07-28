@@ -15,5 +15,9 @@ CLAUDE.md
 # 忽略Logs
 *.log
 
+# 忽略缓存文件
+*.pyc
+*.pyd
+
 # 忽略杂项文件
 /misc/
